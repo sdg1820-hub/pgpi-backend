@@ -10,9 +10,23 @@ const { ocrScorecard } = require("./ocr");
 const { runSchema, seedIfEmpty } = require("./seed");
 
 const app = express();
+
+// --- CORS (dijalankan paling awal, sebelum parser, agar preflight selalu dapat header) ---
+const allowed = (process.env.CORS_ORIGINS || "*").split(",").map((s) => s.trim()).filter(Boolean);
+const corsOptions = {
+  origin(origin, cb) {
+    if (!origin) return cb(null, true);                 // curl / same-origin / app native
+    if (allowed.includes("*") || allowed.includes(origin)) return cb(null, true);
+    return cb(null, false);                              // origin tak diizinkan: tanpa header CORS
+  },
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  maxAge: 86400,
+};
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));                     // tangani semua preflight
+
 app.use(express.json({ limit: "20mb" }));
-const origins = (process.env.CORS_ORIGINS || "*").split(",").map((s) => s.trim());
-app.use(cors({ origin: origins.includes("*") ? true : origins }));
 
 const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(__dirname, "..", "uploads");
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
@@ -46,6 +60,28 @@ app.post("/api/auth/login", wrap(async (req, res) => {
   res.json({ token, role, profile: { id: rec.id, name: rec.name, userId: rec.user_id } });
 }));
 app.get("/api/auth/me", authMiddleware, (req, res) => res.json(req.user));
+
+// Registrasi pemain mandiri (publik). Akun langsung aktif & auto-login.
+// Subuk butuh persetujuan panitia: ganti active:true -> false, lalu panitia aktifkan di konsol.
+app.post("/api/auth/register", wrap(async (req, res) => {
+  const name = (req.body.name || "").trim();
+  const unit = (req.body.unit || "").trim();
+  const assignment = (req.body.assignment || unit).trim();
+  const userId = (req.body.userId || "").toLowerCase().trim();
+  const password = req.body.password || "";
+  if (!name || !unit || !userId || !password) return res.status(400).json({ error: "Lengkapi nama, unit, User ID, dan password" });
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(userId)) return res.status(400).json({ error: "User ID harus berupa email yang valid" });
+  if (password.length < 6) return res.status(400).json({ error: "Password minimal 6 karakter" });
+  const dup = await q("SELECT 1 FROM players WHERE lower(user_id)=$1 UNION SELECT 1 FROM admins WHERE lower(user_id)=$1", [userId]);
+  if (dup.rows.length) return res.status(409).json({ error: "User ID sudah terdaftar. Silakan login." });
+  const r = await q(
+    `INSERT INTO players (user_id, password_hash, name, unit, assignment, active)
+     VALUES ($1,$2,$3,$4,$5,true) RETURNING id, user_id, name`,
+    [userId, await hash(password), name, unit, assignment]);
+  const rec = r.rows[0];
+  const token = sign({ sub: rec.id, role: "player", name: rec.name, userId: rec.user_id });
+  res.status(201).json({ token, role: "player", profile: { id: rec.id, name: rec.name, userId: rec.user_id } });
+}));
 
 // ---------------- SETTINGS ----------------
 app.get("/api/settings", authMiddleware, wrap(async (_req, res) => {
